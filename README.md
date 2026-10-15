@@ -1,50 +1,119 @@
 # GGUF X-Ray
 
-**Paste a Hugging Face GGUF link. See exactly what fits your GPU — read from the real file, not guessed.**
+**Can my computer run this AI model?**
+
+Paste a Hugging Face GGUF link or choose from curated models. See exactly what fits your GPU, estimated generation speed in tokens/second, and get copy-paste commands — read directly from the real file header, not guessed from the model name.
 
 **Live:** https://gfxroy.github.io/gguf-xray/
 
 ![screenshot](docs/screenshot.png)
 
-Paste a model repo or a direct `.gguf` URL. X-Ray fetches only the header with HTTP Range requests, parses the real tensors and metadata, then tells you how many llama.cpp layers fit in the VRAM you have.
+---
 
-## How it works
+## Features
 
-**Header, not the weights.** A GGUF file is a short typed header (magic, version, key-value metadata, tensor names/shapes/types/offsets) followed by a huge aligned weight blob. The header of a 7B Q4_K_M file is typically 1–3 MB, almost all of it tokenizer strings. We request the first 2 MB, parse, and if the parser hits the end of the buffer it throws a typed `NeedMoreBytes` with the offset it needs. The loader doubles the window and Range-fetches again. The weight blob is never downloaded. Local files use `Blob.slice` the same way.
+- **Hardware Library & Detection:**
+  - Searchable catalog of popular GPUs and Macs: NVIDIA GeForce RTX 20 / 30 / 40 / 50 series, Apple Silicon M1–M4 variants with unified memory, AMD Radeon RX 6000 / 7000, Intel Arc, and CPU DDR4/DDR5 fallbacks.
+  - **"Auto-detect" button:** Uses WebGPU adapter information and `navigator.deviceMemory` for instant hardware discovery, with a clear explanation of browser privacy sandboxing.
+  - Custom hardware drawer for custom VRAM, system RAM, memory bandwidth, and Apple unified memory rules.
+- **Curated Models & Custom Links:**
+  - One-click presets for popular modern models: Llama 3.x (1B, 3B, 8B, 70B), Qwen 2.5 & Coder (1.5B, 7B, 14B), Gemma 2 (2B, 9B), Mistral 7B v0.3, Phi 3.5 Mini, and DeepSeek R1 distills (Qwen 1.5B/7B/14B, Llama 8B) verified against active Hugging Face repositories.
+  - Paste any Hugging Face repo ID or direct `.gguf` URL, or inspect a local `.gguf` file using `Blob.slice`.
+- **Instant Human Verdict:**
+  - Clear, jargon-free verdict: **Runs great**, **Runs slowly**, or **Won't fit**.
+  - Key metrics: Estimated tokens/sec, best quantization tier for your device, maximum context length, and exact GPU layer offload ratio.
+  - Sleek memory visualizer bar showing weights, KV cache, compute buffer, and free headroom.
+- **Side-by-Side Quantization Comparison:**
+  - Compares every quantization in the repository (or standard tiers Q2_K through Q8_0): file size, hardware fit, estimated generation speed, and quality tradeoffs.
+  - One-click button to inspect any quant directly from the table.
+- **Ready-to-Run Commands:**
+  - **Ollama:** `ollama run <tag>` and copy-ready `Modelfile` with preconfigured `num_gpu` and `num_ctx`.
+  - **LM Studio:** Recommended GPU offload layers, context length, and Flash Attention settings.
+  - **llama.cpp:** Pre-tuned `llama-server` and `llama-cli` commands with `-ngl`, `-c`, `-fa on`, and `-ctk`/`-ctv` flags.
+- **Shareable Result Links:**
+  - Encodes device, model, quantization, context length, and KV cache settings into the URL hash (`#dev=...&m=...&ctx=...`). Restores state on load and provides an instant "Share result" copy button.
+- **Collapsible Expert Breakdown:**
+  - Tensor datatype counts and byte sizes.
+  - Repeating layer blocks (`blk.0` ... `blk.N`) with GPU vs. CPU placement.
+  - Raw metadata key-value explorer with live filtering.
+  - Network audit reporting exact HTTP Range request bytes read vs. total weight size.
 
-**Parser.** GGUF v2/v3, little-endian. Metadata values cover every `gguf_type` including nested arrays. Large arrays (`tokenizer.ggml.tokens`, vocab scores, anything past a few thousand primitives) are skipped by walking lengths without allocating strings — we keep the count. Tensor infos give exact byte sizes from the ggml type table (block size × bytes per block for F32/F16/BF16, Q4_0…Q8_K, IQ*, TQ*, MXFP4, …).
+---
 
-**Memory model.** Architecture keys (`{arch}.block_count`, `context_length`, `embedding_length`, `attention.head_count`, `head_count_kv` which may be a per-layer array, `key_length` / `value_length`, `sliding_window`, `expert_count` / `expert_used_count`, DeepSeek-2 `kv_lora_rank`) drive the KV cache. For Llama-3-8B that is 32 × 8 × 128 × 2 × 2 = 128 KiB per token in f16. MLA stores a compressed latent (`kv_lora_rank` + rope dim) instead of `n_head_kv × head_dim`. Sliding-window layers (Gemma-style every-other-layer) use `min(ctx, window)`.
+## How It Works
 
-**Compute buffer.** With flash attention (`-fa on`) llama.cpp does not allocate an n_ctx² score matrix. The ggml graph is dominated by FFN scratch:
+### 1. Header, Not the Weights
+A GGUF file begins with a typed header (magic number `GGUF`, version, key-value metadata, tensor names, dimensions, types, and offsets) followed by an aligned binary weight blob. The header of a 7B model is typically only 1–3 MB.
 
-```
-64 MiB graph overhead + 4 × n_ff × 512 × 4 bytes
-```
+X-Ray makes an HTTP Range request for the first 2 MB. If the header extends further, the parser throws a typed `NeedMoreBytes` exception with the required byte offset, and the loader fetches the required range. The multi-gigabyte weight blob is never downloaded. Local files use the browser's `Blob.slice` API identically.
 
-`n_ubatch` is llama-server’s default 512. For MoE, `n_ff` is `expert_feed_forward_length × expert_used_count`. Real backends vary; treat this as ±30%.
+### 2. Speed Estimation Formula (Memory Bandwidth)
+Autoregressive token generation (batch size 1) is memory-bandwidth bound: each generated token requires reading the active model weights from memory into the compute units.
 
-**Offload plan.** llama.cpp `-ngl N` puts the last N repeating layers (`blk.{i}.*`) on the GPU. Embeddings and the output tensor join them only when N equals the layer count (the command then uses `-ngl 99`). GPU VRAM = those weights + KV for those layers + the compute buffer. Apple unified memory is counted at 75% of the listed size. The page emits a copy-ready `llama-server` line and the Ollama env / Modelfile equivalent.
+$$\text{Tokens/sec} = \frac{\text{Memory Bandwidth (bytes/s)} \times \eta}{\text{Active Weights} + \text{KV Cache Size}}$$
+
+- **100% GPU / Unified Memory:**
+  $$\text{tok/s} = \frac{BW_{\text{GPU}} \times 0.75}{W_{\text{GPU}} + KV_{\text{context}}}$$
+  $\eta = 0.75$ models real-world memory efficiency for optimized CUDA and Metal kernels.
+- **Partial Offload:**
+  When weights are split between GPU VRAM and CPU RAM, generation must wait for both memory buses, plus a ~8ms PCIe host-device synchronization penalty per token:
+  $$T_{\text{token}} = \frac{W_{\text{GPU}}}{BW_{\text{GPU}} \times 0.75} + \frac{W_{\text{CPU}}}{BW_{\text{CPU}} \times 0.65} + T_{\text{PCIe}}$$
+  $$\text{tok/s} = \frac{1}{T_{\text{token}}}$$
+- **CPU Only:**
+  Uses dual-channel DDR4 (~35 GB/s) or DDR5 (~60 GB/s) system memory bandwidth with $\eta = 0.65$.
+
+### 3. Architecture-Aware Memory Model
+Metadata keys parsed from the header determine model geometry:
+- `{arch}.block_count` — total transformer layers.
+- `context_length` — maximum training context.
+- `embedding_length`, `attention.head_count`, `attention.head_count_kv` — KV cache dimensions.
+- Multi-Latent Attention (MLA) for DeepSeek architectures: models compressed latent rank (`kv_lora_rank` + RoPE dimension) rather than standard head projection.
+- Sliding window attention (e.g., Gemma 2): calculates token memory based on window patterns.
+
+### 4. Compute Buffer
+With Flash Attention (`-fa on`), llama.cpp sizes the ggml graph allocator to the largest intermediate activation (the feed-forward network scratch), avoiding an $n_{\text{ctx}}^2$ attention score matrix:
+
+$$\text{Buffer} = 64\text{ MiB graph overhead} + 4 \times n_{\text{ff}} \times 512 \times 4\text{ bytes}$$
+
+For Mixture-of-Experts (MoE), $n_{\text{ff}}$ uses $\text{expert\_feed\_forward\_length} \times \text{expert\_used\_count}$.
+
+---
 
 ## Limitations
 
-- Header size is guessed from Range responses. A few CDNs ignore Range; we then stream and abort, but a misbehaving server could still send more than we want.
-- Gated Hugging Face repos need a token in the browser, which this page does not collect. Open the file locally instead.
-- Split GGUF (`-00001-of-00002`) is listed; only the file you pick is parsed.
-- Compute-buffer and CUDA/Metal runtime overhead are estimates. Measure with `llama-server` if you are close to the limit.
-- Big-endian GGUF v3 is not implemented. Almost every public file is little-endian.
-- KV cache ignores prefix-sharing, cache quantization quirks beyond f16/q8_0/q4_0, and draft-model extra memory.
+- A small number of CDNs do not honor HTTP `Range` headers; in those cases, the stream is aborted once the header is read.
+- Gated or private Hugging Face repositories require authentication tokens, which this tool does not ask for. Download the file and use the local file picker instead.
+- Big-endian GGUF v3 is not implemented (virtually all public community models are little-endian).
+- Compute buffer and runtime driver overhead are close approximations ($\pm 20\%$).
+
+---
 
 ## Development
 
 ```bash
+# Install dependencies
 npm install
+
+# Start local Vite development server
 npm run dev
+
+# Run Vitest test suite
 npm test
+
+# Run ESLint and TypeScript check
+npm run lint
+npm run typecheck
+
+# Build for production
 npm run build
+
+# Build for GitHub Pages
+npm run build:pages
 ```
 
-Vite + React + TypeScript. Tests are Vitest against synthetic GGUF buffers. Deployed to GitHub Pages with GitHub Actions.
+Built with React 19, TypeScript, Vite, and Vitest. Deployed to GitHub Pages via GitHub Actions.
+
+---
 
 ## License
 
