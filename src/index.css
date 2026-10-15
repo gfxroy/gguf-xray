@@ -1721,3 +1721,9 @@ details[open] .summary-title::before {
     animation: none;
   }
 }
+
+/* Mobile overflow fixes */
+.family-tabs { max-width: 100%; min-width: 0; }
+.results-actions { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.file-selector-wrap, .file-select { min-width: 0; max-width: 100%; }
+main, section, .card { min-width: 0; }
