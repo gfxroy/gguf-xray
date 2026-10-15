@@ -92,7 +92,9 @@ describe("speed", () => {
       kv: [],
       metadata: {},
       tensors: [],
-      headerBytes: 1000,
+      alignment: 32,
+      infoEnd: 1000,
+      dataStart: 1024,
       tensorBytes: 4 * 1024 ** 3,
     };
     const arch = llama3_8bArch();

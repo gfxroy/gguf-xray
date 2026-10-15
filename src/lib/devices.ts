@@ -594,7 +594,7 @@ export async function detectHardware(): Promise<DetectedHardware> {
     }
   }
 
-  let explanation = "";
+  let explanation: string;
   if (rawGpuName || reportedMemoryGb) {
     const parts: string[] = [];
     if (rawGpuName) parts.push(`GPU identified as "${rawGpuName}" via WebGPU`);

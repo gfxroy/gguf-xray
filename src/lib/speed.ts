@@ -61,8 +61,8 @@ export function estimateSpeed(options: {
   const gpuEfficiency = 0.75;
   const cpuEfficiency = 0.65;
 
-  let timePerTokenSec = 0;
-  let formulaDesc = "";
+  let timePerTokenSec: number;
+  let formulaDesc: string;
 
   if (device.isApple || offloadFraction >= 0.999) {
     // 100% on GPU or unified memory
@@ -195,7 +195,7 @@ export function evaluateDeviceFit(options: {
     verdictType = "great";
     verdictTitle = "Runs great";
     const ctxText = maxContextTokens >= nCtxTrain ? `full ${nCtxTrain.toLocaleString()} context` : `up to ${maxContextTokens.toLocaleString()} context`;
-    verdictDescription = `100% offloaded to ${device.shortName} VRAM. Expect ~${speed.tokPerSec} tok/s with ${ctxText}.`;
+    verdictDescription = `100% offloaded to ${device.shortName} VRAM. Expect ~${speed.tokPerSec} tok/s at ${nCtx.toLocaleString()} context (supports ${ctxText}).`;
   } else if (fitsInVram && speed.tokPerSec < 15) {
     verdictType = "slow";
     verdictTitle = "Runs slowly";

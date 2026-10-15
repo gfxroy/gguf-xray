@@ -199,8 +199,8 @@ function evaluateQuantRow(options: {
 
   let fitsStatus: "Full VRAM" | "Partial" | "CPU Only" | "Won't Fit";
   let fitsBadgeClass: "great" | "slow" | "wont-fit";
-  let ngl = 0;
-  let estTokPerSec = 0;
+  let ngl: number;
+  let estTokPerSec: number;
 
   if (totalNeeded <= vramAvailBytes) {
     fitsStatus = "Full VRAM";

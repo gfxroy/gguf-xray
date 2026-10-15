@@ -1,8 +1,20 @@
-import { useMemo, useRef, useState } from "react";
-import { formatBytes, formatCtx, formatInt } from "./lib/format";
-import { formatMetaValue, type GgufFile } from "./lib/gguf";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { DevicePicker } from "./components/DevicePicker";
+import { ModelPicker } from "./components/ModelPicker";
+import { VerdictBanner } from "./components/VerdictBanner";
+import { QuantTable } from "./components/QuantTable";
+import { CommandsSection } from "./components/CommandsSection";
+import { DetailsSection } from "./components/DetailsSection";
 import {
-  EXAMPLES,
+  DEFAULT_DEVICE,
+  findDevice,
+  type DeviceInfo,
+} from "./lib/devices";
+import {
+  DEFAULT_MODEL,
+  findCuratedModel,
+} from "./lib/models";
+import {
   blobSource,
   httpSource,
   listGgufFiles,
@@ -12,10 +24,19 @@ import {
   resolveUrl,
   type GgufEntry,
 } from "./lib/hf";
+import type { GgufFile } from "./lib/gguf";
 import { archFromMetadata, type KvType } from "./lib/memory";
-import { VRAM_PRESETS, planOffload } from "./lib/planner";
+import { planOffload } from "./lib/planner";
+import { evaluateDeviceFit } from "./lib/speed";
+import { buildCommands } from "./lib/commands";
+import { buildQuantComparison } from "./lib/quants";
+import {
+  parseHashState,
+  updateLocationHash,
+} from "./lib/urlState";
+import { formatBytes } from "./lib/format";
 
-type Ready = {
+type ReadyState = {
   gguf: GgufFile;
   fileName: string;
   bytesRead: number;
@@ -24,61 +45,69 @@ type Ready = {
   files?: GgufEntry[];
 };
 
-function useCopy() {
-  const [done, setDone] = useState(false);
-  const copy = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const t = document.createElement("textarea");
-      t.value = text;
-      document.body.appendChild(t);
-      t.select();
-      document.execCommand("copy");
-      t.remove();
-    }
-    setDone(true);
-    setTimeout(() => setDone(false), 1400);
-  };
-  return [done, copy] as const;
-}
-
 export default function App() {
-  const [url, setUrl] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
-  const [ready, setReady] = useState<Ready | null>(null);
-  const [vramGb, setVramGb] = useState(16);
-  const [apple, setApple] = useState(false);
-  const [nCtx, setNCtx] = useState(8192);
-  const [kvType, setKvType] = useState<KvType>("f16");
-  const [ctxTouched, setCtxTouched] = useState(false);
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [copiedCmd, copyCmd] = useCopy();
-  const [copiedOl, copyOl] = useCopy();
+  const [device, setDevice] = useState<DeviceInfo>(DEFAULT_DEVICE);
+  const [vramGb, setVramGb] = useState<number>(DEFAULT_DEVICE.vramGb);
+  const [appleUnified, setAppleUnified] = useState<boolean>(DEFAULT_DEVICE.isApple);
 
-  const inspect = async (raw: string) => {
+  const [url, setUrl] = useState<string>(DEFAULT_MODEL.repoUrl);
+  const [busy, setBusy] = useState<boolean>(false);
+  const [status, setStatus] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [ready, setReady] = useState<ReadyState | null>(null);
+
+  const [nCtx, setNCtx] = useState<number>(8192);
+  const [kvType, setKvType] = useState<KvType>("f16");
+  const [ctxTouched, setCtxTouched] = useState<boolean>(false);
+
+  const [copiedShare, setCopiedShare] = useState<boolean>(false);
+  const hasInitialized = useRef<boolean>(false);
+
+  const inspect = async (
+    rawUrl: string,
+    targetFile?: string,
+    stateOverrides?: { devId?: string; vram?: number; apple?: boolean; ctx?: number; kv?: KvType }
+  ) => {
     setError("");
     setBusy(true);
-    setStatus("Listing files…");
+    setStatus("Connecting to Hugging Face…");
+
     try {
-      const target = parseHfUrl(raw);
+      const target = parseHfUrl(rawUrl);
       let files: GgufEntry[] | undefined;
       let path: string;
       let size: number | undefined;
+
       if (target.kind === "repo") {
+        setStatus("Listing repository files…");
         files = await listGgufFiles(target.repoId, target.revision);
-        const pick = pickDefaultGguf(files);
-        path = pick.path;
-        size = pick.size;
+
+        if (targetFile) {
+          const match = files.find(
+            (f) => f.path === targetFile || f.path.endsWith(targetFile)
+          );
+          if (match) {
+            path = match.path;
+            size = match.size;
+          } else {
+            const pick = pickDefaultGguf(files);
+            path = pick.path;
+            size = pick.size;
+          }
+        } else {
+          const pick = pickDefaultGguf(files);
+          path = pick.path;
+          size = pick.size;
+        }
       } else {
         path = target.path;
       }
-      setStatus("Reading header…");
+
+      setStatus("Reading GGUF header via Range request…");
       const fileUrl = resolveUrl(target.repoId, target.revision, path);
       const loaded = await loadGgufHeader(httpSource(fileUrl, size));
       const name = path.split("/").pop() ?? path;
+
       setReady({
         gguf: loaded.gguf,
         fileName: name,
@@ -87,21 +116,117 @@ export default function App() {
         repoId: target.repoId,
         files,
       });
+      setUrl(rawUrl);
+
       const arch = archFromMetadata(loaded.gguf.metadata);
-      if (arch && !ctxTouched) setNCtx(Math.min(8192, arch.nCtxTrain));
+      if (arch && !ctxTouched) {
+        setNCtx(Math.min(8192, arch.nCtxTrain));
+      }
+
+      // Update URL hash
+      updateLocationHash({
+        deviceId: stateOverrides?.devId ?? device.id,
+        vramGb: stateOverrides?.vram ?? vramGb,
+        apple: stateOverrides?.apple ?? appleUnified,
+        model: target.repoId,
+        file: name,
+        ctx: stateOverrides?.ctx ?? nCtx,
+        kv: stateOverrides?.kv ?? kvType,
+      });
     } catch (e) {
       setReady(null);
-      setError(e instanceof Error ? e.message : String(e));
+      setError(
+        e instanceof Error
+          ? e.message
+          : "An unexpected error occurred while inspecting the GGUF file."
+      );
     } finally {
       setBusy(false);
       setStatus("");
     }
   };
 
+  // Restore state from URL Hash on mount, or load initial default
+  useEffect(() => {
+    if (hasInitialized.current) return;
+    hasInitialized.current = true;
+
+    if (typeof window !== "undefined" && window.location.hash) {
+      const state = parseHashState(window.location.hash);
+      let devId = DEFAULT_DEVICE.id;
+      let vram = DEFAULT_DEVICE.vramGb;
+      let apple = DEFAULT_DEVICE.isApple;
+
+      if (state.deviceId) {
+        const found = findDevice(state.deviceId);
+        if (found) {
+          setDevice(found);
+          devId = found.id;
+          vram = state.vramGb ?? found.vramGb;
+          apple = state.apple ?? found.isApple;
+          setVramGb(vram);
+          setAppleUnified(apple);
+        } else if (state.vramGb) {
+          vram = state.vramGb;
+          setVramGb(vram);
+          if (state.apple != null) {
+            apple = state.apple;
+            setAppleUnified(apple);
+          }
+        }
+      } else if (state.vramGb) {
+        vram = state.vramGb;
+        setVramGb(vram);
+        if (state.apple != null) {
+          apple = state.apple;
+          setAppleUnified(apple);
+        }
+      }
+
+      if (state.ctx) {
+        setNCtx(state.ctx);
+        setCtxTouched(true);
+      }
+      if (state.kv) setKvType(state.kv);
+
+      if (state.model) {
+        const targetModel = findCuratedModel(state.model)?.repoUrl ?? state.model;
+        setUrl(targetModel);
+        void inspect(targetModel, state.file, {
+          devId,
+          vram,
+          apple,
+          ctx: state.ctx,
+          kv: state.kv,
+        });
+        return;
+      }
+    }
+
+    // Default inspection on initial visit
+    void inspect(DEFAULT_MODEL.repoUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Synchronize URL Hash when settings change
+  const syncHash = (preferredFile?: string) => {
+    const curFile = preferredFile ?? ready?.fileName;
+    updateLocationHash({
+      deviceId: device.id,
+      vramGb,
+      apple: appleUnified,
+      model: ready?.repoId ?? url,
+      file: curFile,
+      ctx: nCtx,
+      kv: kvType,
+    });
+  };
+
   const onLocal = async (file: File) => {
     setError("");
     setBusy(true);
-    setStatus("Reading header…");
+    setStatus(`Reading ${file.name} header locally…`);
+
     try {
       const loaded = await loadGgufHeader(blobSource(file));
       setReady({
@@ -110,11 +235,18 @@ export default function App() {
         bytesRead: loaded.bytesRead,
         totalBytes: loaded.totalBytes,
       });
+
       const arch = archFromMetadata(loaded.gguf.metadata);
-      if (arch && !ctxTouched) setNCtx(Math.min(8192, arch.nCtxTrain));
+      if (arch && !ctxTouched) {
+        setNCtx(Math.min(8192, arch.nCtxTrain));
+      }
     } catch (e) {
       setReady(null);
-      setError(e instanceof Error ? e.message : String(e));
+      setError(
+        e instanceof Error
+          ? e.message
+          : "Could not parse local GGUF file header."
+      );
     } finally {
       setBusy(false);
       setStatus("");
@@ -125,12 +257,14 @@ export default function App() {
     if (!ready?.repoId || !ready.files) return;
     const entry = ready.files.find((f) => f.path === path);
     setBusy(true);
-    setStatus("Reading header…");
+    setStatus("Reading file header…");
     setError("");
+
     try {
       const fileUrl = resolveUrl(ready.repoId, "main", path);
       const loaded = await loadGgufHeader(httpSource(fileUrl, entry?.size));
       const name = path.split("/").pop() ?? path;
+
       setReady({
         ...ready,
         gguf: loaded.gguf,
@@ -138,6 +272,8 @@ export default function App() {
         bytesRead: loaded.bytesRead,
         totalBytes: loaded.totalBytes ?? entry?.size ?? null,
       });
+
+      syncHash(name);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -146,8 +282,26 @@ export default function App() {
     }
   };
 
+  const handleCopyShareLink = async () => {
+    syncHash();
+    const shareUrl = window.location.href;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+    } catch {
+      const t = document.createElement("textarea");
+      t.value = shareUrl;
+      document.body.appendChild(t);
+      t.select();
+      document.execCommand("copy");
+      t.remove();
+    }
+    setCopiedShare(true);
+    setTimeout(() => setCopiedShare(false), 2000);
+  };
+
   const arch = ready ? archFromMetadata(ready.gguf.metadata) : null;
   const maxCtx = arch?.nCtxTrain ?? 131072;
+
   const plan = useMemo(() => {
     if (!ready) return null;
     const ctx = Math.max(512, Math.min(nCtx, maxCtx));
@@ -156,290 +310,229 @@ export default function App() {
       arch,
       fileName: ready.fileName,
       vramGb,
-      appleUnified: apple,
+      appleUnified,
       nCtx: ctx,
       kvType,
     });
-  }, [ready, arch, nCtx, maxCtx, vramGb, apple, kvType]);
+  }, [ready, arch, nCtx, maxCtx, vramGb, appleUnified, kvType]);
+
+  const evaluation = useMemo(() => {
+    if (!ready || !plan) return null;
+    const weightsCpu = Math.max(0, plan.totalWeightBytes - plan.weightsGpu);
+    return evaluateDeviceFit({
+      device,
+      gguf: ready.gguf,
+      arch,
+      vramGb,
+      appleUnified,
+      nCtx,
+      kvType,
+      weightsGpu: plan.weightsGpu,
+      weightsCpu,
+      kvGpu: plan.kvGpu,
+      buffer: plan.buffer,
+      freeVram: plan.free,
+      nLayer: plan.nLayer,
+      ngl: plan.ngl,
+      fullyFits: plan.fullyFits,
+      totalWeightBytes: plan.totalWeightBytes,
+      kvPerToken: plan.kvPerToken,
+    });
+  }, [ready, plan, device, vramGb, appleUnified, nCtx, kvType, arch]);
+
+  const commands = useMemo(() => {
+    if (!ready || !plan) return null;
+    return buildCommands({
+      fileName: ready.fileName,
+      repoId: ready.repoId,
+      ngl: plan.ngl,
+      nLayer: plan.nLayer,
+      fullyFits: plan.fullyFits,
+      nCtx,
+      kvType,
+    });
+  }, [ready, plan, nCtx, kvType]);
+
+  const quantRows = useMemo(() => {
+    if (!ready || !plan) return [];
+    return buildQuantComparison({
+      device,
+      files: ready.files,
+      currentFileName: ready.fileName,
+      currentSizeBytes: ready.totalBytes ?? plan.totalWeightBytes,
+      nLayer: plan.nLayer,
+      vramGb,
+      appleUnified,
+      kvGpuBytes: plan.kvGpu,
+      bufferBytes: plan.buffer,
+    });
+  }, [ready, plan, device, vramGb, appleUnified]);
 
   return (
     <main className="wrap">
-      <header>
-        <div className="brand">GGUF X-Ray</div>
-        <h1>See exactly what fits your GPU.</h1>
-        <p className="lede">
-          Paste a Hugging Face GGUF link. We read the real file header — not a guess from the name.
+      {/* Brand & Hero Header */}
+      <header className="hero-section">
+        <div className="brand-eyebrow">
+          <span className="brand-dot" />
+          <span>GGUF X-RAY · HARDWARE-AWARE MODEL INSPECTOR</span>
+        </div>
+        <h1 className="hero-title">Can my computer run this AI model?</h1>
+        <p className="hero-lede">
+          Pick your hardware, choose an open-source model, and get an instant real-hardware verdict with memory-bandwidth speed estimates and exact run commands.
         </p>
       </header>
 
-      <div className="chips">
-        {EXAMPLES.map((ex) => (
-          <button
-            key={ex.url}
-            type="button"
-            className="chip"
-            aria-pressed={url === ex.url}
-            onClick={() => {
-              setUrl(ex.url);
-              void inspect(ex.url);
-            }}
-          >
-            {ex.label}
-          </button>
-        ))}
-      </div>
-
-      <form
-        className="inspect"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void inspect(url);
+      {/* Step 1: Device Selection */}
+      <DevicePicker
+        currentDevice={device}
+        onSelectDevice={(d) => {
+          setDevice(d);
+          setVramGb(d.vramGb);
+          setAppleUnified(d.isApple);
         }}
-      >
-        <input
-          type="url"
-          inputMode="url"
-          autoComplete="off"
-          spellCheck={false}
-          placeholder="https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          aria-label="Hugging Face GGUF URL"
-        />
-        <button className="primary" type="submit" disabled={busy || !url.trim()}>
-          {busy ? "Reading…" : "Inspect"}
-        </button>
-      </form>
+        vramGb={vramGb}
+        onChangeVram={(v) => setVramGb(v)}
+        isApple={appleUnified}
+        onChangeApple={(ap) => setAppleUnified(ap)}
+      />
 
-      <div className="local">
-        <input
-          ref={fileRef}
-          type="file"
-          accept=".gguf,application/octet-stream"
-          hidden
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) void onLocal(f);
-            e.target.value = "";
-          }}
-        />
-        <button type="button" className="ghost" onClick={() => fileRef.current?.click()}>
-          Or open a local .gguf
-        </button>
-        {status && <span className="status">{status}</span>}
-      </div>
+      {/* Step 2: Model Selection */}
+      <ModelPicker
+        currentUrl={url}
+        onInspectUrl={(u) => inspect(u)}
+        onInspectLocal={(f) => onLocal(f)}
+        busy={busy}
+        status={status}
+      />
 
-      {error && <div className="err fade">{error}</div>}
-
-      {ready && plan && (
-        <section className="fade" aria-live="polite">
-          <p className="meta-line">
-            Read {formatBytes(ready.bytesRead)}
-            {ready.totalBytes != null ? ` of ${formatBytes(ready.totalBytes)}` : ""}
-            {" · "}
-            {arch?.name ?? ready.fileName}
-            {ready.files && ready.files.length > 1 ? "" : ` · ${ready.fileName}`}
-          </p>
-
-          {ready.files && ready.files.length > 1 && (
-            <div className="filepick">
-              <select
-                aria-label="GGUF file"
-                value={ready.files.find((f) => f.path.endsWith(ready.fileName))?.path ?? ready.fileName}
-                onChange={(e) => void switchFile(e.target.value)}
-              >
-                {ready.files.map((f) => (
-                  <option key={f.path} value={f.path}>
-                    {f.path.split("/").pop()} ({formatBytes(f.size)})
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          <h2 className="verdict">{plan.verdict}</h2>
-
-          <Bar plan={plan} />
-
-          <div className="controls">
-            <div className="ctrl">
-              <div className="ctrl-row">
-                <span className="label">VRAM</span>
-                <span className="val">{vramGb} GB{apple ? " unified × 75%" : ""}</span>
-              </div>
-              <div className="presets">
-                {VRAM_PRESETS.map((g) => (
-                  <button key={g} type="button" aria-pressed={vramGb === g} onClick={() => setVramGb(g)}>
-                    {g}
-                  </button>
-                ))}
-              </div>
-              <label className="check">
-                <input type="checkbox" checked={apple} onChange={(e) => setApple(e.target.checked)} />
-                Apple unified memory
-              </label>
-            </div>
-
-            <div className="ctrl">
-              <div className="ctrl-row">
-                <span className="label">Context</span>
-                <span className="val">{formatInt(nCtx)} ({formatCtx(nCtx)})</span>
-              </div>
-              <input
-                type="range"
-                min={512}
-                max={maxCtx}
-                step={ctxStep(maxCtx)}
-                value={Math.min(nCtx, maxCtx)}
-                onChange={(e) => {
-                  setCtxTouched(true);
-                  setNCtx(Number(e.target.value));
-                }}
-                aria-label="Context length"
-              />
-            </div>
-
-            <div className="ctrl">
-              <div className="ctrl-row">
-                <span className="label">KV cache</span>
-              </div>
-              <div className="kvseg presets">
-                {(["f16", "q8_0", "q4_0"] as const).map((t) => (
-                  <button key={t} type="button" aria-pressed={kvType === t} onClick={() => setKvType(t)}>
-                    {t}
-                  </button>
-                ))}
-              </div>
-            </div>
+      {/* Error state */}
+      {error && (
+        <div className="error-banner fade" role="alert">
+          <div className="error-icon">!</div>
+          <div className="error-content">
+            <span className="error-title">Inspection Error</span>
+            <p className="error-desc">{error}</p>
           </div>
+        </div>
+      )}
 
-          <div>
-            <div className="cmd-row">
-              <span className="label">llama.cpp</span>
-              <button type="button" className="ghost" onClick={() => void copyCmd(plan.command)}>
-                {copiedCmd ? "Copied" : "Copy"}
-              </button>
-            </div>
-            <pre className="cmd">{plan.command}</pre>
+      {/* Loading Skeleton */}
+      {busy && !ready && (
+        <div className="skeleton-loading-box fade">
+          <div className="skeleton-line title" />
+          <div className="skeleton-grid">
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
+            <div className="skeleton-card" />
           </div>
+        </div>
+      )}
 
-          <div>
-            <div className="cmd-row">
-              <span className="label">Ollama</span>
-              <button type="button" className="ghost" onClick={() => void copyOl(plan.ollamaEnv)}>
-                {copiedOl ? "Copied" : "Copy"}
-              </button>
+      {/* Ready Results */}
+      {ready && plan && evaluation && commands && (
+        <section className="results-container fade" aria-live="polite">
+          {/* Result Header & Share Button */}
+          <div className="results-top-bar">
+            <div className="results-model-info">
+              <span className="active-model-title">
+                {arch?.name ?? ready.fileName}
+              </span>
+              <span className="active-model-meta">
+                {ready.fileName} · Read {formatBytes(ready.bytesRead)}
+                {ready.totalBytes ? ` of ${formatBytes(ready.totalBytes)}` : ""}
+              </span>
             </div>
-            <pre className="cmd">{plan.ollamaEnv}</pre>
-          </div>
 
-          <div>
-            <div className="label" style={{ marginBottom: 8 }}>
-              Tensors
-            </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>Type</th>
-                  <th className="num">Count</th>
-                  <th className="num">Size</th>
-                </tr>
-              </thead>
-              <tbody>
-                {plan.byType.map((t) => (
-                  <tr key={t.type}>
-                    <td>{t.name}</td>
-                    <td className="num">{t.count}</td>
-                    <td className="num">{formatBytes(t.bytes)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {plan.byLayer.length > 0 && (
-            <details>
-              <summary>Layers ({plan.byLayer.length})</summary>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Layer</th>
-                    <th className="num">Tensors</th>
-                    <th className="num">Weights</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {plan.byLayer.map((l) => (
-                    <tr key={l.layer}>
-                      <td>blk.{l.layer}</td>
-                      <td className="num">{l.count}</td>
-                      <td className="num">{formatBytes(l.bytes)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </details>
-          )}
-
-          <details>
-            <summary>Raw metadata ({ready.gguf.kv.length})</summary>
-            <div className="kvlist">
-              {ready.gguf.kv.map((kv) => (
-                <div key={kv.key}>
-                  <span className="k">{kv.key}</span>
-                  <span className="v">{formatMetaValue(kv.value)}</span>
+            <div className="results-actions">
+              {ready.files && ready.files.length > 1 && (
+                <div className="file-selector-wrap">
+                  <select
+                    className="file-select"
+                    value={
+                      ready.files.find((f) => f.path.endsWith(ready.fileName))?.path ??
+                      ready.fileName
+                    }
+                    onChange={(e) => void switchFile(e.target.value)}
+                    disabled={busy}
+                    aria-label="Select quantization file"
+                  >
+                    {ready.files.map((f) => (
+                      <option key={f.path} value={f.path}>
+                        {f.path.split("/").pop()} ({formatBytes(f.size)})
+                      </option>
+                    ))}
+                  </select>
                 </div>
-              ))}
+              )}
+
+              <button
+                type="button"
+                className="share-btn"
+                onClick={() => void handleCopyShareLink()}
+                title="Copy link to this exact result"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                </svg>
+                <span>{copiedShare ? "Link copied!" : "Share result"}</span>
+              </button>
             </div>
-          </details>
+          </div>
+
+          {/* Verdict Banner with Metrics & Memory Allocation Bar */}
+          <VerdictBanner
+            evaluation={evaluation}
+            plan={plan}
+            nCtx={nCtx}
+            maxCtx={maxCtx}
+            onChangeCtx={(c) => {
+              setCtxTouched(true);
+              setNCtx(c);
+            }}
+            kvType={kvType}
+            onChangeKvType={(k) => setKvType(k)}
+            vramGb={vramGb}
+            onChangeVramGb={(gb) => setVramGb(gb)}
+            appleUnified={appleUnified}
+          />
+
+          {/* Quantization Comparison Table Side by Side */}
+          <QuantTable
+            rows={quantRows}
+            onSelectFile={(path) => void switchFile(path)}
+            busy={busy}
+          />
+
+          {/* Ready-to-Run Commands (Ollama, LM Studio, llama.cpp) */}
+          <CommandsSection commands={commands} />
+
+          {/* Collapsible Details & Expert Breakdown */}
+          <DetailsSection
+            gguf={ready.gguf}
+            plan={plan}
+            speed={evaluation.speed}
+            bytesRead={ready.bytesRead}
+            totalBytes={ready.totalBytes}
+            fileName={ready.fileName}
+          />
         </section>
       )}
 
-      <footer>
-        Reads only the GGUF header via HTTP Range requests. Nothing is uploaded.{" "}
-        <a href="https://github.com/gfxroy/gguf-xray">Source</a>
+      {/* Footer */}
+      <footer className="footer-wrap">
+        <p className="footer-note">
+          GGUF X-Ray reads only typed headers via HTTP Range requests. Never downloads full model weights.
+        </p>
+        <div className="footer-links">
+          <a href="https://github.com/gfxroy/gguf-xray" target="_blank" rel="noreferrer">
+            GitHub Source
+          </a>
+          <span>·</span>
+          <span>MIT License © Aaditya Roy</span>
+        </div>
       </footer>
     </main>
-  );
-}
-
-function ctxStep(max: number): number {
-  if (max <= 4096) return 256;
-  if (max <= 32768) return 512;
-  return 1024;
-}
-
-function Bar({ plan }: { plan: NonNullable<ReturnType<typeof planOffload>> }) {
-  const denom = Math.max(plan.available, plan.used, 1);
-  const w = (plan.weightsGpu / denom) * 100;
-  const k = (plan.kvGpu / denom) * 100;
-  const b = (plan.buffer / denom) * 100;
-  const f = (plan.free / denom) * 100;
-  return (
-    <div>
-      <div className="bar" aria-hidden="true">
-        <div className="seg w" style={{ width: `${w}%` }} />
-        <div className="seg k" style={{ width: `${k}%` }} />
-        <div className="seg b" style={{ width: `${b}%` }} />
-        <div className="seg f" style={{ width: `${f}%` }} />
-      </div>
-      <div className="legend" style={{ marginTop: 10 }}>
-        <span>
-          <span className="swatch w" />
-          weights <b>{formatBytes(plan.weightsGpu)}</b>
-        </span>
-        <span>
-          <span className="swatch k" />
-          KV <b>{formatBytes(plan.kvGpu)}</b>
-        </span>
-        <span>
-          <span className="swatch b" />
-          buffer <b>{formatBytes(plan.buffer)}</b>
-        </span>
-        <span>
-          free <b>{formatBytes(plan.free)}</b>
-        </span>
-      </div>
-    </div>
   );
 }
